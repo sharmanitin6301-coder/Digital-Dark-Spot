@@ -30,9 +30,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Start the server if run directly
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Digital Dark Spot server listening on http://localhost:${PORT}`);
-  });
-}
+ app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Digital Dark Spot server listening on port ${PORT}`);
+});
 
 module.exports = app;
