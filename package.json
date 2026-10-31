@@ -1,0 +1,31 @@
+{
+  "name": "digital-dark-spot",
+  "version": "1.0.0",
+  "description": "Information gap and contradiction detection intelligence platform powered by Google Gemini",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "gemini",
+    "information-gaps",
+    "contradiction-detection",
+    "verification",
+    "threejs"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/genai": "^2.32.0",
+    "cheerio": "^1.2.0",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "ipaddr.js": "^2.5.0"
+  }
+}
