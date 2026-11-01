@@ -192,7 +192,7 @@
       }
       const card = elements.sourcesList ? elements.sourcesList.querySelector(`[data-index="${idx}"]`) : null;
       if (card) {
-        card.querySelectorAll('.source-input-field').forEach((inp) => inp.classList.remove('input-has-error'));
+        card.querySelectorAll('.source-input-field, .pasted-text-area').forEach((inp) => inp.classList.remove('input-has-error'));
       }
     });
   }
@@ -457,6 +457,18 @@
       if (!firstErrorElement && elements.questionInput) firstErrorElement = elements.questionInput;
     }
 
+    // Source count check
+    if (!state.sources || state.sources.length < 2) {
+      const bannerMsg = 'Add at least two valid sources to continue.';
+      showError(bannerMsg);
+      return { valid: false, error: bannerMsg };
+    }
+    if (state.sources.length > 5) {
+      const bannerMsg = 'Maximum 5 sources allowed.';
+      showError(bannerMsg);
+      return { valid: false, error: bannerMsg };
+    }
+
     // 2. Source Validation
     const seenUrls = new Set();
     let validCount = 0;
@@ -481,8 +493,24 @@
 
         try {
           const parsed = new URL(rawUrl);
-          if (!parsed.hostname || !parsed.hostname.includes('.')) {
+          const host = (parsed.hostname || '').toLowerCase();
+          if (!host || !host.includes('.')) {
             setSourceError(idx, 'Please enter a valid HTTP or HTTPS URL.');
+            invalidUrlDetected = true;
+            return;
+          }
+          const isPrivateIp = /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.0\.0\.0)/.test(host);
+          if (
+            host === 'localhost' ||
+            host.endsWith('.local') ||
+            host.includes('sample.digitaldarkspot.local') ||
+            host.endsWith('.internal') ||
+            host.endsWith('.lan') ||
+            host.endsWith('.home') ||
+            host.endsWith('.corp') ||
+            isPrivateIp
+          ) {
+            setSourceError(idx, 'Internal, private, and local addresses (.local) cannot be fetched. Please enter a public web URL or switch to Pasted Text mode.');
             invalidUrlDetected = true;
             return;
           }
@@ -558,48 +586,46 @@
       if (typeof e.stopPropagation === 'function') e.stopPropagation();
     }
 
+    clearErrors();
+
+    // Immediately hide previous results & clear analysis state
+    if (elements.resultsSection) elements.resultsSection.hidden = true;
+    state.analysis = null;
+
+    // Strict validation: Sample Demo requires valid inputs before proceeding
+    const validation = validateInput();
+    if (!validation.valid) {
+      showError(validation.error);
+      return;
+    }
+
     const demo = window.SAMPLE_DEMO_DATA;
     if (!demo || !demo.sources || !demo.analysis) {
       showError('Sample demo dataset not found or incomplete. Please verify sample-data.js is loaded.');
       return;
     }
 
-    clearErrors();
-
-    // 1. Populate state with fictional sample records
-    state.isSampleDemo = true;
-    state.question = demo.question || 'What should I verify about eligibility criteria, renewal conditions, and repayment obligations before applying for scholarships and aid?';
-    if (elements.questionInput) {
-      elements.questionInput.value = state.question;
+    // Preserve the user's valid live input configuration
+    if (!state.isSampleDemo) {
+      state.savedLiveSources = JSON.parse(JSON.stringify(state.sources));
+      state.savedLiveQuestion = elements.questionInput ? elements.questionInput.value : state.question;
     }
 
-    state.sources = demo.sources.map((s) => ({
-      id: s.id,
-      type: s.type || 'url',
-      url: s.url || '',
-      text: s.text || '',
-      title: s.title || '',
-      detectedDate: s.detectedDate || null,
-      fetchStatus: 'success',
-      error: null
-    }));
-
+    // Activate offline sample demo mode
+    state.isSampleDemo = true;
     state.fetchedSources = demo.sources;
     state.analysis = demo.analysis;
     state.checkedItems.clear();
 
-    // Re-render source inputs on Screen 1 so user can edit later
-    renderSources();
-
-    // 2. Immediately switch screens: hide inputs and loading, reveal results dossier
+    // Immediately switch screens: hide inputs and loading, reveal results dossier
     if (elements.loadingSection) elements.loadingSection.hidden = true;
     if (elements.inputSection) elements.inputSection.hidden = true;
     if (elements.resultsSection) elements.resultsSection.hidden = false;
 
-    // 3. Render precomputed verification dossier
+    // Render precomputed verification dossier
     renderResults(demo.analysis);
 
-    // 4. Scroll washi sheet to top of results cleanly
+    // Scroll washi sheet to top of results cleanly
     const paper = document.querySelector('#foot .paper-scroll');
     if (paper) {
       paper.scrollTop = 0;
@@ -607,12 +633,21 @@
       elements.resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
-    // 5. Toast notification confirming offline sample mode
+    // Toast notification confirming offline sample mode
     showToast('Sample Demo loaded offline — no API requests performed.');
   }
 
   // Expose globally so inline onclick handler works immediately
   window.__handleSampleDemo = handleSampleDemo;
+  window.__digitalDarkSpot = {
+    getState: () => state,
+    validateInput,
+    handleSampleDemo,
+    handleFormSubmit,
+    handleBackToInput,
+    renderResults,
+    elements
+  };
 
   async function handleFormSubmit(e) {
     if (e) e.preventDefault();
@@ -740,7 +775,22 @@
           elements.submitBtn.disabled = false;
           elements.submitBtn.innerHTML = 'Analyse Sources <span aria-hidden="true">→</span>';
         }
-        showError('Some sources could not be accessed. Review their status.');
+
+        const failedSources = combinedSources.filter(
+          (s) => s.fetchStatus !== 'success' || !s.text || s.text.trim().length < 50
+        );
+        const failureDetails = failedSources
+          .map((s) => `${s.id}: ${s.error || 'Failed to extract content'}`)
+          .join(' · ');
+
+        let detailedMsg = 'Unable to proceed with analysis. ';
+        if (usableSources.length === 0) {
+          detailedMsg += `None of the provided sources could be accessed (${failureDetails}). Please provide at least two valid public URLs or switch to Pasted Text mode.`;
+        } else {
+          detailedMsg += `Only 1 source was accessible (${usableSources[0].id}). Cross-examination requires at least two usable sources. Please resolve the inaccessible source (${failureDetails}) or add another source.`;
+        }
+
+        showError(detailedMsg);
         return;
       }
 
@@ -791,6 +841,7 @@
       stopLoading();
       elements.inputSection.hidden = false;
       elements.resultsSection.hidden = true;
+      state.analysis = null;
       if (elements.submitBtn) {
         elements.submitBtn.disabled = false;
         elements.submitBtn.innerHTML = 'Analyse Sources <span aria-hidden="true">→</span>';
@@ -814,10 +865,16 @@
       if (elements.sampleDemoNoticeBanner) elements.sampleDemoNoticeBanner.hidden = false;
     } else {
       const activeModel = data.model_used || data.model || 'gemini-3.8-flash';
-      const isFallback = Boolean(data.is_fallback || (activeModel && activeModel !== 'gemini-3.8-flash'));
-      elements.dossierModelTag.textContent = isFallback
-        ? `Gemini Flash (${activeModel} · Fallback)`
-        : `Gemini Flash (${activeModel})`;
+      const provider = (data.provider_used || data.provider || 'gemini').toLowerCase();
+      const isFallback = Boolean(data.is_fallback || (activeModel && activeModel !== 'gemini-3.8-flash') || provider === 'groq');
+
+      if (provider === 'groq') {
+        elements.dossierModelTag.textContent = `Groq (${activeModel} · Fallback)`;
+      } else {
+        elements.dossierModelTag.textContent = isFallback
+          ? `Gemini Flash (${activeModel} · Fallback)`
+          : `Gemini Flash (${activeModel})`;
+      }
       elements.dossierModelTag.classList.remove('sample-tag');
       if (elements.sampleDemoNoticeBanner) elements.sampleDemoNoticeBanner.hidden = true;
     }
@@ -1487,6 +1544,26 @@
       elements.submitBtn.disabled = false;
       elements.submitBtn.innerHTML = 'Analyse Sources <span aria-hidden="true">→</span>';
     }
+
+    // If returning from offline Sample Demo mode, restore the user's live inputs
+    if (state.isSampleDemo) {
+      state.isSampleDemo = false;
+      if (state.savedLiveSources && state.savedLiveSources.length >= 2) {
+        state.sources = state.savedLiveSources;
+        state.question = state.savedLiveQuestion || '';
+      } else {
+        state.sources = [
+          { id: 'S1', type: 'url', url: '', text: '', title: '' },
+          { id: 'S2', type: 'url', url: '', text: '', title: '' }
+        ];
+        state.question = '';
+      }
+      if (elements.questionInput) {
+        elements.questionInput.value = state.question;
+      }
+    }
+
+    clearErrors();
     renderSources();
     const paper = document.querySelector('#foot .paper-scroll');
     if (paper) {

@@ -59,7 +59,7 @@ async function validateUrl(urlString) {
     hostname.endsWith('.home') ||
     hostname.endsWith('.corp')
   ) {
-    throw new Error(`Access to internal/private hostname "${hostname}" is forbidden.`);
+    throw new Error(`Access to internal/private hostname "${hostname}" is forbidden. Please provide a publicly accessible website URL or switch to Pasted Text mode.`);
   }
 
   // Normalize IPv6 hostname brackets if present

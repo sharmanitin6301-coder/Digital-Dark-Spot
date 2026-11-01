@@ -200,7 +200,8 @@ function verifyAllEvidence(analysis, suppliedSources) {
       totalChecked,
       verifiedCount,
       unverifiedCount,
-      invalidSourceCount
+      invalidSourceCount,
+      verificationRate: totalChecked > 0 ? `${Math.round((verifiedCount / totalChecked) * 100)}%` : '100%'
     }
   };
 }

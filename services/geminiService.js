@@ -237,6 +237,37 @@ function buildUserPrompt(question, sources) {
 }
 
 /**
+ * Extracts and normalizes an HTTP status code as an integer from diverse SDK/HTTP error representations.
+ * Handles err.status, err.statusCode, err.response.status, err.error.status, err.error.code,
+ * and string numbers like "429".
+ *
+ * @param {any} err
+ * @returns {number|null}
+ */
+function extractNormalizedHttpStatus(err) {
+  if (!err || typeof err !== 'object') return null;
+
+  const candidates = [
+    err.status,
+    err.statusCode,
+    err.response && err.response.status,
+    err.error && err.error.status,
+    err.error && err.error.code,
+    err.code
+  ];
+
+  for (const c of candidates) {
+    if (typeof c === 'number' && !isNaN(c) && c > 0) return Math.floor(c);
+    if (typeof c === 'string') {
+      const parsed = parseInt(c.trim(), 10);
+      if (!isNaN(parsed) && parsed > 0) return parsed;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Classifies Gemini SDK errors into categorized descriptors.
  * Note: Actual rate limits (RPM, RPD, TPM) depend on the project's Google AI Studio
  * tier (e.g. Free Tier vs Pay-as-you-go), model ID, and region. There is no universal 20 requests/day limit.
@@ -249,18 +280,19 @@ function classifyGeminiError(err) {
     return { type: 'CONFIG', status: err.status || 500, message: err.message };
   }
 
-  const status = err.status || (err.error && err.error.code);
-  const msg = (err.message || '').toLowerCase();
-  const rawDetails = JSON.stringify(err.error || err.details || '').toLowerCase();
+  const status = extractNormalizedHttpStatus(err);
+  const msg = (err && (err.message || '')).toLowerCase();
+  const rawDetails = JSON.stringify((err && (err.error || err.details || err.response || '')) || '').toLowerCase();
+  const combinedText = `${msg} ${rawDetails}`;
 
   // 1. Authentication & Permission Errors (401 / 403)
   if (
     status === 401 ||
     status === 403 ||
-    msg.includes('api_key_invalid') ||
-    msg.includes('api key not valid') ||
-    msg.includes('permission_denied') ||
-    msg.includes('unregistered')
+    combinedText.includes('api_key_invalid') ||
+    combinedText.includes('api key not valid') ||
+    combinedText.includes('permission_denied') ||
+    combinedText.includes('unregistered')
   ) {
     return {
       type: 'AUTH',
@@ -270,19 +302,27 @@ function classifyGeminiError(err) {
   }
 
   // 2. Quota & Rate Limit Errors (429 / RESOURCE_EXHAUSTED)
-  if (status === 429 || msg.includes('resource_exhausted') || msg.includes('quota')) {
-    // Check if error specifies daily or project quota exhaustion (e.g. requests per day limit reached)
-    const isDailyOrProjectQuota =
-      msg.includes('per day') ||
-      msg.includes('requests per day') ||
-      msg.includes('generaterequestsperday') ||
-      msg.includes('daily limit') ||
-      rawDetails.includes('generaterequestsperday') ||
-      rawDetails.includes('free_tier_requests') ||
-      rawDetails.includes('quota exceeded for metric') ||
-      (msg.includes('exceeded your current quota') && msg.includes('retry in') && !msg.includes('retry in 0.'));
+  const is429Status = status === 429;
+  const hasQuotaKeyword =
+    combinedText.includes('resource_exhausted') ||
+    combinedText.includes('quota_exhausted') ||
+    combinedText.includes('quota') ||
+    combinedText.includes('429') ||
+    combinedText.includes('too many requests') ||
+    combinedText.includes('rate limit');
 
-    if (isDailyOrProjectQuota) {
+  if (is429Status || hasQuotaKeyword) {
+    const isDailyOrProjectQuota =
+      combinedText.includes('per day') ||
+      combinedText.includes('requests per day') ||
+      combinedText.includes('generaterequestsperday') ||
+      combinedText.includes('daily limit') ||
+      combinedText.includes('free_tier_requests') ||
+      combinedText.includes('quota exceeded for metric') ||
+      (combinedText.includes('exceeded your current quota') && combinedText.includes('retry in') && !combinedText.includes('retry in 0.'));
+
+    // Genuine 429 or daily quota exhaustion: never downgrade to 500
+    if (isDailyOrProjectQuota || is429Status || combinedText.includes('resource_exhausted') || combinedText.includes('quota_exhausted')) {
       return {
         type: 'QUOTA_EXHAUSTED',
         status: 429,
@@ -290,7 +330,6 @@ function classifyGeminiError(err) {
       };
     }
 
-    // Otherwise it is a temporary burst / RPM rate limit
     return {
       type: 'RATE_LIMIT_TEMPORARY',
       status: 429,
@@ -299,7 +338,7 @@ function classifyGeminiError(err) {
   }
 
   // 3. Service Unavailable / Overloaded (503)
-  if (status === 503 || msg.includes('high demand') || msg.includes('unavailable') || msg.includes('overloaded')) {
+  if (status === 503 || combinedText.includes('high demand') || combinedText.includes('unavailable') || combinedText.includes('overloaded')) {
     return {
       type: 'SERVICE_UNAVAILABLE',
       status: 503,
@@ -308,7 +347,7 @@ function classifyGeminiError(err) {
   }
 
   // 4. Timeout
-  if (err.name === 'TimeoutError' || msg.includes('timeout') || err.code === 'ECONNRESET') {
+  if (err.name === 'TimeoutError' || combinedText.includes('timeout') || err.code === 'ECONNRESET') {
     return {
       type: 'TIMEOUT',
       status: 504,
@@ -317,7 +356,7 @@ function classifyGeminiError(err) {
   }
 
   // 5. Invalid JSON structure from model
-  if (err.status === 502 || msg.includes('invalid json')) {
+  if (status === 502 || combinedText.includes('invalid json')) {
     return {
       type: 'INVALID_JSON',
       status: 502,
@@ -327,8 +366,8 @@ function classifyGeminiError(err) {
 
   return {
     type: 'UNKNOWN',
-    status: 500,
-    message: 'An error occurred while generating analysis with Google Gemini.'
+    status: status || 500,
+    message: err.message || 'An error occurred while generating analysis with Google Gemini.'
   };
 }
 
@@ -345,9 +384,11 @@ async function executeWithBackoff(fn, modelName) {
   let attempt = 0;
   while (true) {
     try {
+      console.log(`[Gemini] Attempting ${modelName} (attempt ${attempt + 1}/${BACKOFF_CONFIG.maxRetries + 1})...`);
       return await fn();
     } catch (err) {
       const errInfo = classifyGeminiError(err);
+      console.warn(`[Gemini] ${modelName} attempt ${attempt + 1} failed: type=${errInfo.type}, status=${errInfo.status}`);
 
       // Stop immediately on Auth or Daily Quota Exhaustion - no point retrying the same condition
       if (errInfo.type === 'AUTH' || errInfo.type === 'QUOTA_EXHAUSTED') {
@@ -364,6 +405,7 @@ async function executeWithBackoff(fn, modelName) {
 
       if (isRetryable && attempt < BACKOFF_CONFIG.maxRetries) {
         const delay = BACKOFF_CONFIG.initialDelayMs * Math.pow(BACKOFF_CONFIG.backoffFactor, attempt);
+        console.log(`[Gemini] Retrying ${modelName} in ${delay}ms...`);
         attempt++;
         await new Promise((resolve) => setTimeout(resolve, delay));
         continue;
@@ -422,20 +464,32 @@ async function generateAnalysis(question, validSources) {
     // Fallback to gemini-3.6-flash
     const shouldFallback =
       primaryErr.errorType === 'QUOTA_EXHAUSTED' ||
+      primaryErr.errorType === 'RATE_LIMIT_TEMPORARY' ||
       primaryErr.errorType === 'SERVICE_UNAVAILABLE' ||
       primaryErr.status === 404;
 
     if (shouldFallback) {
       try {
+        console.log(`[Gemini] Primary model ${PRIMARY_MODEL} unavailable (${primaryErr.message}). Initiating fallback to ${FALLBACK_MODEL}...`);
         response = await executeWithBackoff(() => callModel(FALLBACK_MODEL), FALLBACK_MODEL);
         modelUsed = FALLBACK_MODEL;
         isFallback = true;
       } catch (fallbackErr) {
-        // Fallback model also failed - throw clear categorized error
+        // Both primary and internal fallback models failed
+        // If either failed with quota/rate exhaustion, ensure typed QUOTA_EXHAUSTED with status 429 is propagated
+        if (
+          primaryErr.errorType === 'QUOTA_EXHAUSTED' ||
+          fallbackErr.errorType === 'QUOTA_EXHAUSTED' ||
+          primaryErr.status === 429 ||
+          fallbackErr.status === 429
+        ) {
+          fallbackErr.status = 429;
+          fallbackErr.errorType = 'QUOTA_EXHAUSTED';
+        }
         throw fallbackErr;
       }
     } else {
-      // Primary model failed with temporary rate limit after retries, timeout, etc.
+      // Primary model failed with non-quota error (e.g. timeout, format error, etc.)
       throw primaryErr;
     }
   }
@@ -444,6 +498,7 @@ async function generateAnalysis(question, validSources) {
   let parsed;
   try {
     parsed = JSON.parse(response.text);
+    console.log(`[Gemini] Structured JSON successfully generated with ${modelUsed} (isFallback: ${isFallback})`);
   } catch (parseErr) {
     // Retry once only
     try {
@@ -481,8 +536,10 @@ module.exports = {
   getGeminiClient,
   generateAnalysis,
   classifyGeminiError,
+  extractNormalizedHttpStatus,
   executeWithBackoff,
   formatGeminiError,
+  buildUserPrompt,
   PRIMARY_MODEL,
   FALLBACK_MODEL,
   BACKOFF_CONFIG,
